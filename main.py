@@ -1,6 +1,15 @@
 import os
 
-from intent import Pipeline, GHLClient, ContactsRepo, CursorRepo, AggregatesRepo, OpenAIClassifier, JsonStore
+from intent import (
+    Pipeline,
+    GHLClient,
+    ContactsRepo,
+    CursorRepo,
+    AggregatesRepo,
+    OpenAIClassifier,
+    JsonStore,
+    CategoryMessagesRepo
+)
 
 # =============================
 # Main
@@ -13,7 +22,7 @@ def main():
         cursors=CursorRepo(JsonStore("data/cursors.json")),
         aggregates=AggregatesRepo(JsonStore("data/aggregates.json")),
         classifier=OpenAIClassifier(os.getenv("OPENAI_API_KEY")),
-        # salt=os.getenv("USER_HASH_SALT")
+        messages_repo=CategoryMessagesRepo(JsonStore(os.path.join("data", "messages_by_category.json")))
     )
     pipeline.run()
 

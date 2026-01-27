@@ -35,16 +35,6 @@ class TimeUtil:
         return a if TimeUtil.parse_iso(a) >= TimeUtil.parse_iso(b) else b
 
 
-class HashUtil:
-    @staticmethod
-    def user_hash(contact_id: str, salt: str) -> str:
-        return hashlib.sha256(f"{salt}:{contact_id}".encode()).hexdigest()
-
-    @staticmethod
-    def msg_fp(contact_id: str, ts: str, body: str) -> str:
-        return hashlib.sha256(f"{contact_id}|{ts}|{body}".encode()).hexdigest()
-
-
 class RetryUtil:
     @staticmethod
     def run(fn, retries=3, delay=2):
@@ -154,21 +144,21 @@ class AggregatesRepo:
 # =============================
 
 class CategoryAggregator:
-    def __init__(self, salt: str):
-        self.salt = salt
+    def __init__(self):
         self.counts = {}
         self.users = {}
 
     def merge(self, persisted):
         for cat, meta in persisted["categories"].items():
             self.counts[cat] = self.counts.get(cat, 0) + meta["message_count"]
-            self.users.setdefault(cat, set()).update(meta["unique_user_hashes"])
+
+            # Merge real contact IDs
+            self.users.setdefault(cat, set()).update(meta["unique_user_ids"])
 
     def ingest(self, contact_id: str, categories: List[str]):
-        uh = HashUtil.user_hash(contact_id, self.salt)
         for cat in categories:
             self.counts[cat] = self.counts.get(cat, 0) + 1
-            self.users.setdefault(cat, set()).add(uh)
+            self.users.setdefault(cat, set()).add(contact_id)
 
     def export(self):
         return {
@@ -176,7 +166,7 @@ class CategoryAggregator:
                 cat: {
                     "message_count": self.counts[cat],
                     "unique_user_count": len(self.users[cat]),
-                    "unique_user_hashes": list(self.users[cat]),
+                    "unique_user_ids": list(self.users[cat]),
                 }
                 for cat in self.counts
             }
@@ -269,6 +259,25 @@ class GHLClient:
             ))
 
         return out
+
+
+
+class CategoryMessagesRepo:
+    def __init__(self, store: JsonStore):
+        self.store = store
+
+    def load(self):
+        return self.store.load({})
+
+    def append(self, category: str, message_obj: dict):
+        data = self.load()
+
+        if category not in data:
+            data[category] = []
+
+        data[category].append(message_obj)
+
+        self.store.save(data)
 
 # =============================
 # OpenAI Classifier
@@ -364,56 +373,66 @@ class OpenAIClassifier:
 # =============================
 
 class Pipeline:
-    def __init__(self, client, contacts, cursors, aggregates, classifier):
+    def __init__(self, client, contacts, cursors, aggregates, messages_repo, classifier):
         self.client = client
         self.contacts = contacts
         self.cursors = cursors
         self.aggregates = aggregates
         self.classifier = classifier
-        # self.salt = salt
+        self.messages_repo = messages_repo
 
     def run(self):
         contacts = self.client.fetch_contacts()
         self.contacts.upsert(contacts)
 
-        # agg = CategoryAggregator(self.salt)
-        # agg.merge(self.aggregates.load())
-        # cursors = self.cursors.load()
-        # cursor_updates = {}
-        # seen = set()
-        #
-        # for i, cid in enumerate(self.contacts.load()):
-        #     email = self.contacts.load()[cid]["email"]
-        #     last_ts = cursors.get(cid)
-        #
-        #     try:
-        #         raw = self.client.fetch_messages(email)
-        #     except Exception as e:
-        #         print(f"[skip] {email} error={e}")
-        #         continue
-        #
-        #     for m in self.client.extract_inbound(raw):
-        #         if last_ts and TimeUtil.parse_iso(m.timestamp) <= TimeUtil.parse_iso(last_ts):
-        #             continue
-        #
-        #         fp = HashUtil.msg_fp(cid, m.timestamp, m.body)
-        #         if fp in seen:
-        #             continue
-        #         seen.add(fp)
-        #
-        #         cats = self.classifier.classify([m.body])[0]
-        #         # agg.ingest(cid, cats)
-        #         cursor_updates[cid] = TimeUtil.newer(cursor_updates.get(cid), m.timestamp)
-        #
-        #     if len(cursor_updates) >= 20:
-        #         self.cursors.bulk_update(cursor_updates)
-        #         cursor_updates.clear()
-        #
-        #     if i % 25 == 0 and i > 0:
-        #         print(f"[progress] contacts={i}")
-        #
-        # if cursor_updates:
-        #     self.cursors.bulk_update(cursor_updates)
+        agg = CategoryAggregator()
+        agg.merge(self.aggregates.load())
+        cursors = self.cursors.load()
+        cursor_updates = {}
+        seen = set()
 
-        # self.aggregates.save(agg.export())
+        for i, cid in enumerate(self.contacts.load()):
+            email = self.contacts.load()[cid]["email"]
+            last_ts = cursors.get(cid)
+
+            try:
+                raw = self.client.fetch_messages(email)
+            except Exception as e:
+                print(f"[skip] {email} error={e}")
+                continue
+
+            for m in self.client.extract_inbound(raw):
+                if last_ts and TimeUtil.parse_iso(m.timestamp) <= TimeUtil.parse_iso(last_ts):
+                    continue
+
+                key = (cid, m.timestamp, m.body)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                cats = self.classifier.classify([m.body])[0]
+
+                agg.ingest(cid, cats)
+
+                for cat in cats:
+                    self.messages_repo.append(cat, {
+                        "contact_id": cid,
+                        "email": m.email,
+                        "timestamp": m.timestamp,
+                        "message": m.body
+                    })
+
+                cursor_updates[cid] = TimeUtil.newer(cursor_updates.get(cid), m.timestamp)
+
+            if len(cursor_updates) >= 20:
+                self.cursors.bulk_update(cursor_updates)
+                cursor_updates.clear()
+
+            if i % 25 == 0 and i > 0:
+                print(f"[progress] contacts={i}")
+
+        if cursor_updates:
+            self.cursors.bulk_update(cursor_updates)
+
+        self.aggregates.save(agg.export())
         print("[done] pipeline completed")
