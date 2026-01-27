@@ -8,7 +8,7 @@ from intent import (
     AggregatesRepo,
     OpenAIClassifier,
     JsonStore,
-    CategoryMessagesRepo
+    # CategoryMessagesRepo
 )
 
 # =============================
@@ -22,7 +22,7 @@ def main():
         cursors=CursorRepo(JsonStore("data/cursors.json")),
         aggregates=AggregatesRepo(JsonStore("data/aggregates.json")),
         classifier=OpenAIClassifier(os.getenv("OPENAI_API_KEY")),
-        messages_repo=CategoryMessagesRepo(JsonStore(os.path.join("data", "messages_by_category.json")))
+        # messages_repo=CategoryMessagesRepo(JsonStore(os.path.join("data", "messages_by_category.json")))
     )
     pipeline.run()
 

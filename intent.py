@@ -4,15 +4,15 @@ import os
 import json
 import time
 import math
-import hashlib
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Tuple
 from datetime import datetime, timezone
 
 import requests
 from dateutil.parser import isoparse
 from dotenv import load_dotenv
 from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, RateLimitError, APIError
 
 load_dotenv()
 
@@ -37,11 +37,17 @@ class TimeUtil:
 
 class RetryUtil:
     @staticmethod
-    def run(fn, retries=3, delay=2):
+    def run(fn, retries=5, delay=2, retry_on: Tuple[type, ...] = ()):
+        """
+        Exponential backoff retry.
+        If retry_on is provided, only those exceptions are retried.
+        """
         for i in range(retries):
             try:
                 return fn()
             except Exception as e:
+                if retry_on and not isinstance(e, retry_on):
+                    raise
                 if i == retries - 1:
                     raise
                 sleep = delay * (2 ** i)
@@ -78,19 +84,17 @@ class JsonStore:
     def load(self, default):
         if not os.path.exists(self.path):
             return default
-
         try:
-            with open(self.path, "r") as f:
+            with open(self.path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except json.JSONDecodeError:
             print(f"[warning] Corrupted JSON detected: {self.path} — resetting file")
             return default
 
-
     def save(self, data):
         tmp = self.path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(data, f, indent=2)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, self.path)
 
 # =============================
@@ -101,16 +105,26 @@ class ContactsRepo:
     def __init__(self, store: JsonStore):
         self.store = store
 
-    def load(self):
+    def load(self) -> Dict[str, dict]:
         return self.store.load({})
 
-    def upsert(self, contacts: List[Contact]):
+    def upsert(self, contacts: List[Contact]) -> Tuple[int, int]:
+        """
+        Dedup by contact_id. Persist immediately.
+        Returns (added_count, total_count)
+        """
         data = self.load()
         added = 0
         for c in contacts:
             if c.contact_id not in data:
                 data[c.contact_id] = {"email": c.email, "phone": c.phone}
                 added += 1
+            else:
+                # keep latest non-empty values
+                if c.email and not data[c.contact_id].get("email"):
+                    data[c.contact_id]["email"] = c.email
+                if c.phone and not data[c.contact_id].get("phone"):
+                    data[c.contact_id]["phone"] = c.phone
         self.store.save(data)
         return added, len(data)
 
@@ -119,7 +133,7 @@ class CursorRepo:
     def __init__(self, store: JsonStore):
         self.store = store
 
-    def load(self):
+    def load(self) -> Dict[str, str]:
         return self.store.load({})
 
     def bulk_update(self, updates: Dict[str, str]):
@@ -132,11 +146,32 @@ class AggregatesRepo:
     def __init__(self, store: JsonStore):
         self.store = store
 
-    def load(self):
-        return self.store.load({"categories": {}})
+    def load(self) -> dict:
+        return self.store.load({"categories": {}, "updated_at": None})
 
-    def save(self, data):
+    def save(self, data: dict):
         data["updated_at"] = datetime.now(timezone.utc).isoformat()
+        self.store.save(data)
+
+
+class CategoryMessagesRepo:
+    """
+    Stores messages grouped by category:
+    {
+      "Pricing Inquiry": [ {contact_id,email,timestamp,message}, ... ],
+      ...
+    }
+    """
+    def __init__(self, store: JsonStore):
+        self.store = store
+
+    def load(self) -> dict:
+        return self.store.load({})
+
+    def append_bulk(self, category_to_messages: Dict[str, List[dict]]):
+        data = self.load()
+        for cat, msgs in category_to_messages.items():
+            data.setdefault(cat, []).extend(msgs)
         self.store.save(data)
 
 # =============================
@@ -144,41 +179,33 @@ class AggregatesRepo:
 # =============================
 
 class CategoryAggregator:
-    def __init__(self):
-        self.counts = {}
-        self.users = {}
-
-    def merge(self, persisted):
-        for cat, meta in persisted["categories"].items():
-            self.counts[cat] = self.counts.get(cat, 0) + meta["message_count"]
-
-            # Merge real contact IDs
-            self.users.setdefault(cat, set()).update(meta["unique_user_ids"])
-
-    def ingest(self, contact_id: str, categories: List[str]):
-        for cat in categories:
-            self.counts[cat] = self.counts.get(cat, 0) + 1
-            self.users.setdefault(cat, set()).add(contact_id)
-
-    def export(self):
-        return {
-            "categories": {
-                cat: {
-                    "message_count": self.counts[cat],
-                    "unique_user_count": len(self.users[cat]),
-                    "unique_user_ids": list(self.users[cat]),
-                }
-                for cat in self.counts
-            }
-        }
+    """
+    Aggregates counts + unique users per category in-memory, but we persist per-user immediately.
+    """
+    @staticmethod
+    def apply_user_counts(aggregates: dict, contact_id: str, counts: Dict[str, int]):
+        aggregates.setdefault("categories", {})
+        for cat, cnt in counts.items():
+            if cnt <= 0:
+                continue
+            meta = aggregates["categories"].setdefault(cat, {
+                "message_count": 0,
+                "unique_user_count": 0,
+                "unique_user_ids": []
+            })
+            meta["message_count"] += int(cnt)
+            if contact_id not in meta["unique_user_ids"]:
+                meta["unique_user_ids"].append(contact_id)
+                meta["unique_user_count"] = len(meta["unique_user_ids"])
+        return aggregates
 
 # =============================
-# API Client (FIXED PAGINATION)
+# API Client
 # =============================
 
 class GHLClient:
-    def __init__(self, base_url, api_key, timeout=20):
-        self.base_url = base_url
+    def __init__(self, base_url: str, api_key: str, timeout=20):
+        self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
         self.session = requests.Session()
@@ -190,24 +217,42 @@ class GHLClient:
         }
 
     def fetch_contacts(self) -> List[Contact]:
+        """
+        Fetch contacts page-by-page and return list.
+        Dedup happens in ContactsRepo.upsert.
+        """
         url = f"{self.base_url}/api/v1/ghl/search-contacts"
         page, limit = 1, 10
-        all_contacts = []
+        all_contacts: List[Contact] = []
 
         # First call to get total
         resp = RetryUtil.run(
-            lambda: self.session.post(url, json={"page": 1, "page_limit": limit}, headers=self._headers(), timeout=self.timeout)
+            lambda: self.session.post(
+                url,
+                json={"page": 1, "page_limit": limit},
+                headers=self._headers(),
+                timeout=self.timeout
+            ),
+            retries=5,
+            delay=2,
+            retry_on=(requests.RequestException,)
         )
         data = resp.json()
         total = data.get("total", 0)
-        total_pages = math.ceil(total / limit)
-
+        total_pages = max(1, math.ceil(total / limit))
         print(f"[contacts] total={total} pages={total_pages}")
 
         while page <= total_pages:
-            payload = {"page": page, "page_limit": limit}
             resp = RetryUtil.run(
-                lambda: self.session.post(url, json=payload, headers=self._headers(), timeout=self.timeout)
+                lambda: self.session.post(
+                    url,
+                    json={"page": page, "page_limit": limit},
+                    headers=self._headers(),
+                    timeout=self.timeout
+                ),
+                retries=5,
+                delay=2,
+                retry_on=(requests.RequestException,)
             )
             data = resp.json()
             contacts = data.get("contacts", [])
@@ -226,71 +271,63 @@ class GHLClient:
 
         return all_contacts
 
-    def fetch_messages(self, email: str):
+    def fetch_messages(self, email: str) -> dict:
         url = f"{self.base_url}/api/v1/ghl/list-messages"
         return RetryUtil.run(
-            lambda: self.session.post(url, json={"email": email}, headers=self._headers(), timeout=self.timeout).json()
+            lambda: self.session.post(
+                url,
+                json={"email": email},
+                headers=self._headers(),
+                timeout=self.timeout
+            ).json(),
+            retries=5,
+            delay=2,
+            retry_on=(requests.RequestException,)
         )
 
     def extract_inbound(self, raw: dict) -> List[InboundMessage]:
         msgs = raw.get("messages", [])
-        contact_id = raw.get("contact_id")  # ✅ from envelope
+        contact_id = raw.get("contact_id")
         email = raw.get("email")
 
         if not contact_id or not email:
             return []
 
-        out = []
+        out: List[InboundMessage] = []
         for m in msgs:
             if m.get("direction") != "inbound":
                 continue
-
             body = m.get("body")
             date_added = m.get("date_added")
-
             if not body or not date_added:
                 continue
 
             out.append(InboundMessage(
                 contact_id=str(contact_id),
-                email=email,
-                body=body,
-                timestamp=date_added
+                email=str(email),
+                body=str(body),
+                timestamp=str(date_added)
             ))
 
         return out
-
-
-
-class CategoryMessagesRepo:
-    def __init__(self, store: JsonStore):
-        self.store = store
-
-    def load(self):
-        return self.store.load({})
-
-    def append(self, category: str, message_obj: dict):
-        data = self.load()
-
-        if category not in data:
-            data[category] = []
-
-        data[category].append(message_obj)
-
-        self.store.save(data)
 
 # =============================
 # OpenAI Classifier
 # =============================
 
 class OpenAIClassifier:
-    def __init__(self, api_key: str, model: str = "gpt-4o-mini"):
+    """
+    Send ALL new messages for a user in ONE call.
+    OpenAI returns PER-MESSAGE assignments.
+    We parse and enforce correctness ourselves (SDK-compatible).
+    """
+
+    def __init__(self, api_key: str, model: str = "gpt-4.1-mini"):
         if not api_key:
-            raise ValueError("OPENAI_API_KEY is required for OpenAIClassifier")
+            raise ValueError("OPENAI_API_KEY is required")
         self.client = OpenAI(api_key=api_key)
         self.model = model
 
-        # Fixed category set (DO NOT change without versioning)
         self.allowed_categories = [
             "Pricing Inquiry",
             "Schedule Inquiry",
@@ -300,139 +337,233 @@ class OpenAIClassifier:
             "Other"
         ]
 
-    def classify(self, texts: List[str]) -> List[List[str]]:
-        """
-        Input:  list of message texts
-        Output: list of category lists (same order)
-        """
-
-        if not texts:
+    def classify_assignments(self, messages: List[str]) -> List[str]:
+        if not messages:
             return []
 
-        system_prompt = (
-            "You are an AI classifier for an education platform.\n"
-            "Your job is to categorize user chat messages.\n\n"
-            "Rules:\n"
-            "- You MUST use ONLY the allowed categories.\n"
-            "- Multiple categories per message are allowed.\n"
-            "- Do NOT invent new categories.\n"
-            "- Do NOT include explanations.\n"
-            "- Do NOT repeat the message text.\n"
-            "- Output MUST be valid JSON only.\n"
+        def call():
+            resp = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a strict classifier.\n"
+                            "For EACH message, output EXACTLY ONE category.\n"
+                            "Do NOT merge, drop, reorder, or skip messages.\n"
+                            "Use ONLY allowed categories.\n"
+                            "Return ONLY valid JSON in this exact format:\n"
+                            "{ \"assignments\": [ {\"id\": 0, \"category\": \"...\"} ] }\n"
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps({
+                            "allowed_categories": self.allowed_categories,
+                            "messages": [
+                                {"id": i, "text": t}
+                                for i, t in enumerate(messages)
+                            ]
+                        })
+                    }
+                ],
+                temperature=0
+            )
+
+            # ---- SAFE JSON EXTRACTION ----
+            raw = resp.output_text
+            start = raw.find("{")
+            end = raw.rfind("}")
+
+            if start == -1 or end == -1:
+                raise ValueError("OpenAI returned no JSON")
+
+            parsed = json.loads(raw[start:end + 1])
+            assignments = parsed.get("assignments")
+
+            if not isinstance(assignments, list):
+                raise ValueError("Invalid assignments structure")
+
+            # Enforce one assignment per message
+            if len(assignments) != len(messages):
+                raise ValueError(
+                    f"Assignment length mismatch: expected {len(messages)}, got {len(assignments)}"
+                )
+
+            cat_by_id = {}
+            for a in assignments:
+                if (
+                    not isinstance(a, dict)
+                    or "id" not in a
+                    or "category" not in a
+                    or a["category"] not in self.allowed_categories
+                ):
+                    raise ValueError(f"Invalid assignment: {a}")
+                cat_by_id[a["id"]] = a["category"]
+
+            # Guarantee order
+            return [cat_by_id[i] for i in range(len(messages))]
+
+        return RetryUtil.run(
+            call,
+            retries=6,
+            delay=2,
+            retry_on=(APIConnectionError, APITimeoutError, RateLimitError, APIError)
         )
 
-        user_prompt = {
-            "allowed_categories": self.allowed_categories,
-            "messages": [
-                {"id": i, "text": text}
-                for i, text in enumerate(texts)
-            ],
-            "output_format": {
-                "results": [
-                    ["Category A", "Category B"]
-                ]
-            }
-        }
-
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_prompt)}
-            ],
-            temperature=0
-        )
-
-        raw = response.choices[0].message.content.strip()
-
-        try:
-            parsed = json.loads(raw)
-            results = parsed.get("results")
-
-            # Validate output shape
-            if not isinstance(results, list) or len(results) != len(texts):
-                raise ValueError("Invalid result length")
-
-            # Validate categories
-            for cats in results:
-                if not isinstance(cats, list):
-                    raise ValueError("Categories must be list")
-                for c in cats:
-                    if c not in self.allowed_categories:
-                        raise ValueError(f"Invalid category: {c}")
-
-            return results
-
-        except Exception as e:
-            print(f"[openai] invalid response, falling back. error={e}")
-            # Safe fallback: mark all as Other
-            return [["Other"] for _ in texts]
 
 # =============================
 # Pipeline
 # =============================
 
 class Pipeline:
-    def __init__(self, client, contacts, cursors, aggregates, messages_repo, classifier):
+    def __init__(
+        self,
+        client: GHLClient,
+        contacts_repo: ContactsRepo,
+        cursor_repo: CursorRepo,
+        aggregates_repo: AggregatesRepo,
+        category_messages_repo: CategoryMessagesRepo,
+        classifier: OpenAIClassifier,
+    ):
         self.client = client
-        self.contacts = contacts
-        self.cursors = cursors
-        self.aggregates = aggregates
+        self.contacts_repo = contacts_repo
+        self.cursor_repo = cursor_repo
+        self.aggregates_repo = aggregates_repo
+        self.category_messages_repo = category_messages_repo
         self.classifier = classifier
-        self.messages_repo = messages_repo
 
     def run(self):
-        contacts = self.client.fetch_contacts()
-        self.contacts.upsert(contacts)
+        # 1) Fetch contacts (paged), store + dedup
+        # contacts = self.client.fetch_contacts()
+        # added, total = self.contacts_repo.upsert(contacts)
+        # print(f"[contacts] upserted added={added} total={total}")
 
-        agg = CategoryAggregator()
-        agg.merge(self.aggregates.load())
-        cursors = self.cursors.load()
-        cursor_updates = {}
-        seen = set()
+        contacts_map = self.contacts_repo.load()
+        cursors = self.cursor_repo.load()
 
-        for i, cid in enumerate(self.contacts.load()):
-            email = self.contacts.load()[cid]["email"]
+        # Load aggregates once, but persist per user (real-time)
+        aggregates = self.aggregates_repo.load()
+
+        for idx, (cid, meta) in enumerate(contacts_map.items(), start=1):
+            email = meta.get("email")
+            if not email:
+                continue
+
             last_ts = cursors.get(cid)
 
+            # 2) Fetch messages for user
             try:
                 raw = self.client.fetch_messages(email)
             except Exception as e:
-                print(f"[skip] {email} error={e}")
+                print(f"[skip] fetch_messages email={email} error={e}")
                 continue
 
-            for m in self.client.extract_inbound(raw):
+            inbound_all = self.client.extract_inbound(raw)
+            if not inbound_all:
+                continue
+
+            # 3) Filter only NEW messages (timestamp > cursor), dedup within batch
+            inbound_new: List[InboundMessage] = []
+            seen_keys = set()
+
+            for m in inbound_all:
                 if last_ts and TimeUtil.parse_iso(m.timestamp) <= TimeUtil.parse_iso(last_ts):
                     continue
-
-                key = (cid, m.timestamp, m.body)
-                if key in seen:
+                key = (m.timestamp, m.body.strip())
+                if key in seen_keys:
                     continue
-                seen.add(key)
+                seen_keys.add(key)
+                inbound_new.append(m)
 
-                cats = self.classifier.classify([m.body])[0]
+            if not inbound_new:
+                continue
 
-                agg.ingest(cid, cats)
+            inbound_new.sort(key=lambda x: TimeUtil.parse_iso(x.timestamp))
+            texts = [m.body for m in inbound_new]
 
-                for cat in cats:
-                    self.messages_repo.append(cat, {
-                        "contact_id": cid,
-                        "email": m.email,
-                        "timestamp": m.timestamp,
-                        "message": m.body
-                    })
+            # 4) Send ALL new messages for this user to OpenAI in ONE call
+            try:
+                assigned_categories = self.classifier.classify_assignments(texts)
+            except Exception as e:
+                # Critical: do NOT update cursor if OpenAI fails
+                print(f"[skip] openai_failed email={email} error={e}")
+                continue
 
-                cursor_updates[cid] = TimeUtil.newer(cursor_updates.get(cid), m.timestamp)
+            # 5) Build counts + category->messages mapping
+            counts: Dict[str, int] = {}
+            cat_to_msgs: Dict[str, List[dict]] = {}
 
-            if len(cursor_updates) >= 20:
-                self.cursors.bulk_update(cursor_updates)
-                cursor_updates.clear()
+            for m, cat in zip(inbound_new, assigned_categories):
+                counts[cat] = counts.get(cat, 0) + 1
+                cat_to_msgs.setdefault(cat, []).append({
+                    "contact_id": cid,
+                    "email": m.email,
+                    "timestamp": m.timestamp,
+                    "message": m.body
+                })
 
-            if i % 25 == 0 and i > 0:
-                print(f"[progress] contacts={i}")
+            # 6) Persist category messages immediately (real-time)
+            self.category_messages_repo.append_bulk(cat_to_msgs)
 
-        if cursor_updates:
-            self.cursors.bulk_update(cursor_updates)
+            # 7) Update aggregates immediately (real-time)
+            aggregates = CategoryAggregator.apply_user_counts(aggregates, cid, counts)
+            self.aggregates_repo.save(aggregates)
 
-        self.aggregates.save(agg.export())
+            # 8) Update cursor immediately (real-time) — ONLY after success
+            newest_ts = inbound_new[-1].timestamp
+            self.cursor_repo.bulk_update({cid: newest_ts})
+            cursors[cid] = newest_ts  # keep in-memory current
+
+            if idx % 25 == 0:
+                print(f"[progress] contacts_processed={idx}")
+
         print("[done] pipeline completed")
+
+# =============================
+# Main
+# =============================
+
+def main():
+    upcademy_base_url = os.getenv("UPCADEMY_BASE_URL", "").strip()
+    upcademy_api_key = os.getenv("UPCADEMY_API_KEY", "").strip()
+    openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    if not upcademy_base_url or not upcademy_api_key:
+        raise ValueError("Missing UPCADEMY_API_KEY or GHL_API_KEY")
+    if not openai_api_key:
+        raise ValueError("Missing OPENAI_API_KEY")
+
+    # Stores
+    contacts_store = JsonStore("data/contacts.json")
+    cursors_store = JsonStore("data/cursors.json")
+    aggregates_store = JsonStore("data/aggregates.json")
+    category_messages_store = JsonStore("data/category_messages.json")
+
+    # Repos
+    contacts_repo = ContactsRepo(contacts_store)
+    cursor_repo = CursorRepo(cursors_store)
+    aggregates_repo = AggregatesRepo(aggregates_store)
+    category_messages_repo = CategoryMessagesRepo(category_messages_store)
+
+    # Clients
+    upcademy_client = GHLClient(
+        base_url=upcademy_base_url,
+        api_key=upcademy_api_key,
+        timeout=25
+    )
+    classifier = OpenAIClassifier(api_key=openai_api_key, model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"))
+
+    pipeline = Pipeline(
+        client=upcademy_client,
+        contacts_repo=contacts_repo,
+        cursor_repo=cursor_repo,
+        aggregates_repo=aggregates_repo,
+        category_messages_repo=category_messages_repo,
+        classifier=classifier
+    )
+    pipeline.run()
+
+
+if __name__ == "__main__":
+    main()
