@@ -217,36 +217,29 @@ class GHLClient:
         }
 
     def fetch_contacts(self) -> List[Contact]:
-        """
-        Fetch contacts page-by-page and return list.
-        Dedup happens in ContactsRepo.upsert.
-        """
         url = f"{self.base_url}/api/v1/ghl/search-contacts"
-        page, limit = 1, 10
+
+        page_limit = 500  # API max
+        page = 1
+        search_after = None
+
         all_contacts: List[Contact] = []
+        seen_contact_ids = set()
 
-        # First call to get total
-        resp = RetryUtil.run(
-            lambda: self.session.post(
-                url,
-                json={"page": 1, "page_limit": limit},
-                headers=self._headers(),
-                timeout=self.timeout
-            ),
-            retries=5,
-            delay=2,
-            retry_on=(requests.RequestException,)
-        )
-        data = resp.json()
-        total = data.get("total", 0)
-        total_pages = max(1, math.ceil(total / limit))
-        print(f"[contacts] total={total} pages={total_pages}")
+        while True:
+            payload = {
+                "page": page,
+                "page_limit": page_limit,
+            }
 
-        while page <= total_pages:
+            # Only send search_after after first request
+            if search_after:
+                payload["search_after"] = search_after
+
             resp = RetryUtil.run(
                 lambda: self.session.post(
                     url,
-                    json={"page": page, "page_limit": limit},
+                    json=payload,
                     headers=self._headers(),
                     timeout=self.timeout
                 ),
@@ -254,18 +247,60 @@ class GHLClient:
                 delay=2,
                 retry_on=(requests.RequestException,)
             )
+
             data = resp.json()
+
+            if not data.get("success"):
+                print(f"[contacts] API failed: {data.get('message')}")
+                break
+
             contacts = data.get("contacts", [])
+            total_available = data.get("total", 0)
 
+            if not contacts:
+                print("[contacts] no more contacts, stopping")
+                break
+
+            # Deduplication + extraction logic (unchanged in spirit)
             for c in contacts:
-                if c.get("id") and c.get("email"):
-                    all_contacts.append(Contact(
-                        contact_id=str(c["id"]),
-                        email=c["email"],
-                        phone=c.get("phone")
-                    ))
+                cid = c.get("id")
+                email = c.get("email")
 
-            print(f"[contacts] fetched page {page}")
+                if not cid or not email:
+                    continue
+
+                if cid in seen_contact_ids:
+                    continue
+
+                seen_contact_ids.add(cid)
+
+                all_contacts.append(
+                    Contact(
+                        contact_id=str(cid),
+                        email=email,
+                        phone=c.get("phone")
+                    )
+                )
+
+            print(
+                f"[contacts] page={page}, "
+                f"batch={len(contacts)}, "
+                f"total={len(all_contacts)}/{total_available}"
+            )
+
+            # Stop if we already fetched everything
+            if len(all_contacts) >= total_available:
+                print("[contacts] fetched all available contacts")
+                break
+
+            # Cursor MUST come from last contact
+            last_contact = contacts[-1]
+            search_after = last_contact.get("search_after")
+
+            if not search_after:
+                print("[contacts] missing search_after, stopping to avoid infinite loop")
+                break
+
             page += 1
             time.sleep(0.2)
 
@@ -329,11 +364,20 @@ class OpenAIClassifier:
         self.model = model
 
         self.allowed_categories = [
-            "Pricing Inquiry",
-            "Schedule Inquiry",
-            "Trial Booking",
-            "Technical Issue",
-            "General Question",
+            "Trial Class",
+            "Plans & Pricing",
+            "Discounts & Offers",
+            "Subscription",
+            "Class Management",
+            "Curriculum",
+            "Account Management",
+            "Billing",
+            "Referral",
+            "Churn Signals",
+            "Technical Questions",
+            "Terms of Service",
+            "Class Questions",
+            "General Questions",
             "Other"
         ]
 
@@ -347,14 +391,27 @@ class OpenAIClassifier:
                 input=[
                     {
                         "role": "system",
-                        "content": (
-                            "You are a strict classifier.\n"
-                            "For EACH message, output EXACTLY ONE category.\n"
-                            "Do NOT merge, drop, reorder, or skip messages.\n"
-                            "Use ONLY allowed categories.\n"
-                            "Return ONLY valid JSON in this exact format:\n"
-                            "{ \"assignments\": [ {\"id\": 0, \"category\": \"...\"} ] }\n"
-                        )
+                        "content" : (
+                "You are a deterministic classification engine, not a chatbot.\n"
+                "\n"
+                "YOU MUST FOLLOW THESE RULES EXACTLY:\n"
+                "1. Every input message MUST receive EXACTLY ONE category.\n"
+                "2. The number of output assignments MUST equal the number of input messages.\n"
+                "3. You MUST NOT merge, summarize, group, reorder, or skip messages.\n"
+                "4. Each assignment MUST reference the same id as the input message.\n"
+                "5. Even short, repetitive, or meaningless messages (e.g. 'ok', 'thanks') MUST still receive a category.\n"
+                "6. You MUST use ONLY the allowed categories provided.\n"
+                "7. Output MUST be valid JSON ONLY — no text, no explanations, no markdown.\n"
+                "\n"
+                "REQUIRED OUTPUT FORMAT (JSON ONLY):\n"
+                "{\n"
+                "  \"assignments\": [\n"
+                "    { \"id\": 0, \"category\": \"Pricing Inquiry\" }\n"
+                "  ]\n"
+                "}\n"
+                "\n"
+                "If the output does not contain exactly one assignment per input message, the output is INVALID.\n"
+            )
                     },
                     {
                         "role": "user",
@@ -435,9 +492,9 @@ class Pipeline:
 
     def run(self):
         # 1) Fetch contacts (paged), store + dedup
-        # contacts = self.client.fetch_contacts()
-        # added, total = self.contacts_repo.upsert(contacts)
-        # print(f"[contacts] upserted added={added} total={total}")
+        contacts = self.client.fetch_contacts()
+        added, total = self.contacts_repo.upsert(contacts)
+        print(f"[contacts] upserted added={added} total={total}")
 
         contacts_map = self.contacts_repo.load()
         cursors = self.cursor_repo.load()
