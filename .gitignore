@@ -7,3 +7,8 @@ data/
 contacts_all.json
 /__pycache__
 preply_tutors.csv
+students_by_price.png
+Tutor_Price_Summary.xlsx
+tutors_by_price.png
+tutors_by_price_range.png
+active_students_vs_price.png
