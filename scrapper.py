@@ -225,7 +225,7 @@ def scrape_page(page_url, writer, session):
         return 0
 
 
-def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tutors_french.csv'):
+def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tutors_luganda.csv'):
     total_tutors = 0
     session = requests.Session()
     write_mode = 'w' if start_page == 1 else 'a'
@@ -253,8 +253,8 @@ def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tu
 
 
 if __name__ == "__main__":
-    BASE_URL    = 'https://preply.com/en/online/french-tutors'
-    TOTAL_PAGES = 556
+    BASE_URL    = 'https://preply.com/en/online/cebuano-tutors'
+    TOTAL_PAGES = 1
     START_PAGE  = 1
 
     scrape_all_pages(BASE_URL, TOTAL_PAGES, start_page=START_PAGE)
