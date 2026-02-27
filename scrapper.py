@@ -3,6 +3,8 @@ from bs4 import BeautifulSoup
 import csv
 import time
 import random
+import math
+import re
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -251,10 +253,89 @@ def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tu
 
     print(f"\n✅ Done! {total_tutors} tutors saved to {output_file}")
 
+import re
+import math
+
+def get_total_pages(session, base_url):
+
+    response = session.get(base_url, headers=HEADERS, timeout=20)
+    soup = BeautifulSoup(response.content, "html.parser")
+
+    total_tutors = None
+
+    # Find ALL spans with that class
+    spans = soup.find_all("span", class_=lambda c: c and "ButtonBase--content" in c)
+
+    for span in spans:
+        text = span.get_text(strip=True)
+
+        if "Show" in text and "tutors" in text:
+            match = re.search(r"([\d,]+)", text)
+            if match:
+                total_tutors = int(match.group(1).replace(",", ""))
+                break
+
+    if not total_tutors:
+        print("Could not detect tutor count. Defaulting to 1 page.")
+        return 100
+
+    total_pages = math.ceil(total_tutors / 10)
+
+    print(f"Total tutors: {total_tutors}")
+    print(f"Total pages: {total_pages}")
+
+    return total_pages
+
+def extract_subject_from_url(url):
+    """
+    Extract subject name from:
+    https://preply.com/en/online/luganda-tutors
+    """
+    slug = url.rstrip("/").split("/")[-1]
+    slug = slug.replace("-tutors", "")
+    return slug
+
+def log_404(url):
+    with open("invalid_subject_urls.txt", "a", encoding="utf-8") as f:
+        f.write(url + "\n")
+        f.flush()
+    print("Logged 404:", url)
 
 if __name__ == "__main__":
-    BASE_URL    = 'https://preply.com/en/online/cebuano-tutors'
-    TOTAL_PAGES = 1
-    START_PAGE  = 1
 
-    scrape_all_pages(BASE_URL, TOTAL_PAGES, start_page=START_PAGE)
+    session = requests.Session()
+
+    with open("subject_urls.txt", "r", encoding="utf-8") as f:
+        subject_urls = [line.strip() for line in f if line.strip()]
+
+    for base_url in subject_urls:
+
+        print(f"\n===== Checking Subject URL: {base_url} =====")
+
+        # Check if URL is valid before scraping
+        response = session.get(base_url, headers=HEADERS, timeout=20)
+
+        if response.status_code == 404:
+            print("❌ 404 detected")
+            log_404(base_url)
+            continue
+
+        if response.status_code != 200:
+            print(f"❌ Failed with HTTP {response.status_code}")
+            log_404(base_url)
+            continue
+
+        subject_name = extract_subject_from_url(base_url)
+
+        print(f"===== Scraping Subject: {subject_name} =====")
+
+        total_pages = get_total_pages(session, base_url)
+
+        output_file = f"preply_tutors_{subject_name}.csv"
+
+        scrape_all_pages(
+            base_url=base_url,
+            total_pages=total_pages,
+            start_page=1,
+            output_file=output_file
+        )
