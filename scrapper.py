@@ -196,44 +196,80 @@ def extract_tutor_details(tutor_div):
         return None
 
 
-def scrape_page(page_url, writer, session):
-    try:
-        response = session.get(page_url, headers=HEADERS, timeout=20)
+# Retry config for non-200 responses
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 10  # seconds
+RETRY_DELAY_429 = 60   # seconds for rate limit
 
-        if response.status_code == 429:
-            print("  Rate limited. Waiting 60s...")
-            time.sleep(60)
+
+def scrape_page(page_url, writer, session):
+    """Fetch a page with retries. Returns (tutor_count, success).
+    success=False means we never got 200 (caller should try next page, not break).
+    """
+    last_exception = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
             response = session.get(page_url, headers=HEADERS, timeout=20)
 
-        if response.status_code != 200:
-            print(f"  Failed — HTTP {response.status_code}")
-            return 0
+            if response.status_code == 429:
+                wait = RETRY_DELAY_429
+                print(f"  Rate limited. Waiting {wait}s (attempt {attempt}/{MAX_RETRIES})...")
+                time.sleep(wait)
+                response = session.get(page_url, headers=HEADERS, timeout=20)
 
-        soup = BeautifulSoup(response.content, 'html.parser')
-        tutor_divs = soup.find_all('section', {'data-qa-group': 'tutor-profile'})
+            if response.status_code != 200:
+                print(f"  Failed — HTTP {response.status_code} (attempt {attempt}/{MAX_RETRIES})")
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_DELAY_BASE * attempt
+                    print(f"  Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    print("  All retries exhausted — skipping to next page.")
+                    return 0, False
+                continue
 
-        if not tutor_divs:
-            print("  No tutor cards found — possibly blocked.")
-            with open('debug_page.html', 'w', encoding='utf-8') as f:
-                f.write(response.text)
-            print("  Raw HTML saved to debug_page.html")
-            return 0
+            # Got 200 — parse and return
+            soup = BeautifulSoup(response.content, 'html.parser')
+            tutor_divs = soup.find_all('section', {'data-qa-group': 'tutor-profile'})
 
-        print(f"  Found {len(tutor_divs)} tutors.")
-        count = 0
-        for tutor_div in tutor_divs:
-            tutor = extract_tutor_details(tutor_div)
-            if tutor:
-                writer.writerow(tutor)
-                count += 1
-        return count
+            if not tutor_divs:
+                print("  No tutor cards found — possibly blocked.")
+                with open('debug_page.html', 'w', encoding='utf-8') as f:
+                    f.write(response.text)
+                print("  Raw HTML saved to debug_page.html")
+                return 0, True  # success=True so caller can apply "batch < 10" rule
 
-    except requests.exceptions.Timeout:
-        print("  Timeout. Skipping.")
-        return 0
-    except Exception as e:
-        print(f"  Page error: {e}")
-        return 0
+            print(f"  Found {len(tutor_divs)} tutors.")
+            count = 0
+            for tutor_div in tutor_divs:
+                tutor = extract_tutor_details(tutor_div)
+                if tutor:
+                    writer.writerow(tutor)
+                    count += 1
+            return count, True
+
+        except requests.exceptions.Timeout:
+            last_exception = "Timeout"
+            print(f"  Timeout (attempt {attempt}/{MAX_RETRIES}).")
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY_BASE * attempt
+                print(f"  Retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                print("  All retries exhausted — skipping to next page.")
+                return 0, False
+        except Exception as e:
+            last_exception = e
+            print(f"  Page error: {e} (attempt {attempt}/{MAX_RETRIES})")
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY_BASE * attempt
+                print(f"  Retrying in {delay}s...")
+                time.sleep(delay)
+            else:
+                print("  All retries exhausted — skipping to next page.")
+                return 0, False
+
+    return 0, False
 
 
 def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tutors_luganda.csv'):
@@ -254,10 +290,14 @@ def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tu
 
         for page in range(start_page, total_pages + 1):
             print(f"\nScraping page {page}/{total_pages}...")
-            count = scrape_page(f"{base_url}?page={page}", writer, session)
+            count, success = scrape_page(f"{base_url}?page={page}", writer, session)
             total_tutors += count
             print(f"  → Saved: {count} | Total so far: {total_tutors}")
             file.flush()
+            # Only break when we successfully fetched and got fewer than 10 tutors (last page)
+            if success and count < 10:
+                print(f"  Last page reached (batch {count} < 10). Stopping.")
+                break
             time.sleep(random.uniform(2.0, 4.5))
 
     print(f"\n✅ Done! {total_tutors} tutors saved to {output_file}")
@@ -343,11 +383,36 @@ def scrape_until_end(base_url, output_file):
 
             print(f"\nScraping page {page}...")
 
-            response = session.get(page_url, headers=HEADERS, timeout=20)
+            response = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    response = session.get(page_url, headers=HEADERS, timeout=20)
+                    if response.status_code == 429:
+                        print(f"  Rate limited. Waiting {RETRY_DELAY_429}s (attempt {attempt}/{MAX_RETRIES})...")
+                        time.sleep(RETRY_DELAY_429)
+                        response = session.get(page_url, headers=HEADERS, timeout=20)
+                    if response.status_code != 200:
+                        print(f"  HTTP {response.status_code} (attempt {attempt}/{MAX_RETRIES})")
+                        if attempt < MAX_RETRIES:
+                            time.sleep(RETRY_DELAY_BASE * attempt)
+                            continue
+                        print("  All retries exhausted — skipping to next page.")
+                        page += 1
+                        response = None
+                        break
+                    break  # got 200
+                except (requests.exceptions.Timeout, Exception) as e:
+                    print(f"  Error: {e} (attempt {attempt}/{MAX_RETRIES})")
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY_BASE * attempt)
+                    else:
+                        print("  All retries exhausted — skipping to next page.")
+                        page += 1
+                        response = None
+                        break
 
-            if response.status_code != 200:
-                print("Page request failed.")
-                break
+            if response is None or response.status_code != 200:
+                continue
 
             soup = BeautifulSoup(response.content, "html.parser")
 
@@ -372,9 +437,9 @@ def scrape_until_end(base_url, output_file):
 
             print(f"Saved {count} tutors")
 
-            # Stop condition
-            if count < tutors_per_page:
-                print("Last page reached.")
+            # Stop only when we got a successful fetch and batch is less than 10
+            if count < 10:
+                print("Last page reached (batch < 10).")
                 break
 
             page += 1
