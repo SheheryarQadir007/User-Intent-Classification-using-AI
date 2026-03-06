@@ -1,3 +1,4 @@
+import os
 import requests
 from bs4 import BeautifulSoup
 import csv
@@ -5,6 +6,31 @@ import time
 import random
 import math
 import re
+import logging
+
+# Log file so you can check on the server that the job ran
+LOG_FILE = os.environ.get("PREPLY_SCRAPER_LOG", "preply_scraper.log")
+
+
+def setup_logging():
+    """Write to preply_scraper.log (with timestamps) and also to console."""
+    global logger
+    fmt = "%(asctime)s | %(levelname)s | %(message)s"
+    date_fmt = "%Y-%m-%d %H:%M:%S"
+    logging.basicConfig(
+        level=logging.INFO,
+        format=fmt,
+        datefmt=date_fmt,
+        handlers=[
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+            logging.StreamHandler(),
+        ],
+    )
+    logger = logging.getLogger(__name__)
+    return logger
+
+
+logger = None  # set by setup_logging() when run as __main__
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -301,6 +327,8 @@ def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tu
             time.sleep(random.uniform(2.0, 4.5))
 
     print(f"\n✅ Done! {total_tutors} tutors saved to {output_file}")
+    if logger:
+        logger.info("Subject saved %d tutors to %s", total_tutors, output_file)
 
 import re
 import math
@@ -446,6 +474,8 @@ def scrape_until_end(base_url, output_file):
             time.sleep(random.uniform(2.0,4.5))
 
     print(f"\nScraped total tutors: {total_tutors}")
+    if logger:
+        logger.info("Subject (dynamic) saved %d tutors", total_tutors)
 
 def log_404(url):
     with open("invalid_subject_urls.txt", "a", encoding="utf-8") as f:
@@ -455,43 +485,66 @@ def log_404(url):
 
 if __name__ == "__main__":
 
+    logger = setup_logging()
+    logger.info("Scraper run started")
+
     session = requests.Session()
 
     with open("subject_urls.txt", "r", encoding="utf-8") as f:
         subject_urls = [line.strip() for line in f if line.strip()]
 
-    for base_url in subject_urls:
+    logger.info("Subjects to process: %d | Log file: %s", len(subject_urls), LOG_FILE)
+    subjects_done = 0
 
-        print(f"\n===== Checking Subject URL: {base_url} =====")
+    try:
+        for base_url in subject_urls:
 
-        # Check if URL is valid before scraping
-        response = session.get(base_url, headers=HEADERS, timeout=20)
+            print(f"\n===== Checking Subject URL: {base_url} =====")
 
-        if response.status_code == 404:
-            print("❌ 404 detected")
-            log_404(base_url)
-            continue
+            # Check if URL is valid before scraping
+            response = session.get(base_url, headers=HEADERS, timeout=20)
 
-        if response.status_code != 200:
-            print(f"❌ Failed with HTTP {response.status_code}")
-            log_404(base_url)
-            continue
+            if response.status_code == 404:
+                print("❌ 404 detected")
+                log_404(base_url)
+                logger.warning("404 skipped: %s", base_url)
+                continue
 
-        subject_name = extract_subject_from_url(base_url)
+            if response.status_code != 200:
+                print(f"❌ Failed with HTTP {response.status_code}")
+                log_404(base_url)
+                logger.warning("HTTP %s skipped: %s", response.status_code, base_url)
+                continue
 
-        print(f"===== Scraping Subject: {subject_name} =====")
+            subject_name = extract_subject_from_url(base_url)
+            logger.info("Subject started: %s", subject_name)
 
-        total_pages = get_total_pages(session, base_url)
+            print(f"===== Scraping Subject: {subject_name} =====")
 
-        output_file = f"preply_tutors_data/preply_tutors_{subject_name}.csv"
+            total_pages = get_total_pages(session, base_url)
 
-        if total_pages > 1:
-            scrape_all_pages(
-                base_url=base_url,
-                total_pages=total_pages,
-                start_page=1,
-                output_file=output_file
-            )
-        else:
-            print("Page detection failed — switching to dynamic pagination")
-            scrape_until_end(base_url, output_file)
+            output_file = f"preply_tutors_data/preply_tutors_{subject_name}.csv"
+
+            if total_pages > 1:
+                scrape_all_pages(
+                    base_url=base_url,
+                    total_pages=total_pages,
+                    start_page=1,
+                    output_file=output_file
+                )
+            else:
+                print("Page detection failed — switching to dynamic pagination")
+                scrape_until_end(base_url, output_file)
+
+            subjects_done += 1
+            logger.info("Subject completed: %s -> %s", subject_name, output_file)
+
+        logger.info("Scraper run finished successfully | Subjects completed: %d", subjects_done)
+        logger.info("Scraper run ended")
+        print(f"\n========== Scraper run complete | Subjects completed: {subjects_done} ==========")
+        print(f"Scraper run ended. Check {LOG_FILE} for details.")
+
+    except Exception as e:
+        logger.exception("Scraper run failed: %s", e)
+        print(f"\n========== Scraper run stopped with error ==========")
+        raise
