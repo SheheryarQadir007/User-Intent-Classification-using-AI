@@ -44,12 +44,21 @@ def extract_tutor_details(tutor_div):
             country = flag_img.get('alt', 'N/A')
 
         # ── PROFILE BADGE (Professional / Super Tutor etc.) ───────────────────
-        # <span class="badge__Aj95L"><span class="label__F86ML">Professional</span></span>
-        badge = 'N/A'
-        badge_tag = tutor_div.find('span', class_=lambda c: c and 'label__' in c)
-        if badge_tag:
-            badge = safe_text(badge_tag)
+        # captures both Professional and Super Tutor badges
 
+        badge = 'N/A'
+
+        badges = []
+
+        badge_labels = tutor_div.select('span.badge__Aj95L span.label__F86ML')
+
+        for b in badge_labels:
+            text = safe_text(b)
+            if text not in badges:
+                badges.append(text)
+
+        if badges:
+            badge = ", ".join(badges)
         # ── PROFILE IMAGE ─────────────────────────────────────────────────────
         # <img alt="Tutor english Maayan D." src="...">
         image_url = 'N/A'
@@ -261,9 +270,23 @@ def get_total_pages(session, base_url):
     response = session.get(base_url, headers=HEADERS, timeout=20)
     soup = BeautifulSoup(response.content, "html.parser")
 
-    total_tutors = None
+    # ─────────────────────────────────────────
+    # METHOD 1 — DIRECT PAGE COUNT (BEST)
+    # ─────────────────────────────────────────
+    page_span = soup.find(
+        "span",
+        attrs={"data-preply-ds-component": "Text"},
+        string=lambda s: s and s.strip().isdigit()
+    )
 
-    # Find ALL spans with that class
+    if page_span:
+        pages = int(page_span.text.strip())
+        print(f"Detected pages directly: {pages}")
+        return pages
+
+    # ─────────────────────────────────────────
+    # METHOD 2 — TOTAL TUTOR COUNT (FALLBACK)
+    # ─────────────────────────────────────────
     spans = soup.find_all("span", class_=lambda c: c and "ButtonBase--content" in c)
 
     for span in spans:
@@ -273,18 +296,18 @@ def get_total_pages(session, base_url):
             match = re.search(r"([\d,]+)", text)
             if match:
                 total_tutors = int(match.group(1).replace(",", ""))
-                break
+                pages = math.ceil(total_tutors / 10)
 
-    if not total_tutors:
-        print("Could not detect tutor count. Defaulting to 1 page.")
-        return 100
+                print(f"Total tutors: {total_tutors}")
+                print(f"Calculated pages: {pages}")
 
-    total_pages = math.ceil(total_tutors / 10)
+                return pages
 
-    print(f"Total tutors: {total_tutors}")
-    print(f"Total pages: {total_pages}")
-
-    return total_pages
+    # ─────────────────────────────────────────
+    # LAST RESORT
+    # ─────────────────────────────────────────
+    print("Could not detect page count. Defaulting to 1 page.")
+    return 1
 
 def extract_subject_from_url(url):
     """
@@ -294,6 +317,70 @@ def extract_subject_from_url(url):
     slug = url.rstrip("/").split("/")[-1]
     slug = slug.replace("-tutors", "")
     return slug
+
+def scrape_until_end(base_url, output_file):
+
+    session = requests.Session()
+    total_tutors = 0
+    page = 1
+    tutors_per_page = None
+
+    with open(output_file, "w", newline="", encoding="utf-8") as file:
+
+        fieldnames = [
+            'tutor_id','name','profile_url','country','badge',
+            'image_url','online_status','price','lesson_duration',
+            'rating','reviews','students','lessons','teaches',
+            'speaks','desc_title','desc_body'
+        ]
+
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+
+        while True:
+
+            page_url = f"{base_url}?page={page}"
+
+            print(f"\nScraping page {page}...")
+
+            response = session.get(page_url, headers=HEADERS, timeout=20)
+
+            if response.status_code != 200:
+                print("Page request failed.")
+                break
+
+            soup = BeautifulSoup(response.content, "html.parser")
+
+            tutor_divs = soup.find_all('section', {'data-qa-group': 'tutor-profile'})
+
+            if not tutor_divs:
+                print("No tutors found — stopping.")
+                break
+
+            if tutors_per_page is None:
+                tutors_per_page = len(tutor_divs)
+                print(f"Detected tutors per page: {tutors_per_page}")
+
+            count = 0
+
+            for tutor_div in tutor_divs:
+                tutor = extract_tutor_details(tutor_div)
+                if tutor:
+                    writer.writerow(tutor)
+                    count += 1
+                    total_tutors += 1
+
+            print(f"Saved {count} tutors")
+
+            # Stop condition
+            if count < tutors_per_page:
+                print("Last page reached.")
+                break
+
+            page += 1
+            time.sleep(random.uniform(2.0,4.5))
+
+    print(f"\nScraped total tutors: {total_tutors}")
 
 def log_404(url):
     with open("invalid_subject_urls.txt", "a", encoding="utf-8") as f:
@@ -331,11 +418,15 @@ if __name__ == "__main__":
 
         total_pages = get_total_pages(session, base_url)
 
-        output_file = f"preply_tutors_{subject_name}.csv"
+        output_file = f"preply_tutors_data/preply_tutors_{subject_name}.csv"
 
-        scrape_all_pages(
-            base_url=base_url,
-            total_pages=total_pages,
-            start_page=1,
-            output_file=output_file
-        )
+        if total_pages > 1:
+            scrape_all_pages(
+                base_url=base_url,
+                total_pages=total_pages,
+                start_page=1,
+                output_file=output_file
+            )
+        else:
+            print("Page detection failed — switching to dynamic pagination")
+            scrape_until_end(base_url, output_file)

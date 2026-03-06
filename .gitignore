@@ -13,3 +13,4 @@ debug_page.html
 /preply_tutors_data
 invalid_subject_urls.txt
 preply_subjects_summary.csv
+*.csv
