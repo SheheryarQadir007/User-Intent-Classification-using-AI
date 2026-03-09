@@ -12,25 +12,18 @@ import logging
 LOG_FILE = os.environ.get("PREPLY_SCRAPER_LOG", "preply_scraper.log")
 
 
+logger = logging.getLogger("preply_scraper")
+logger.setLevel(logging.INFO)
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+logger.addHandler(_console)
+
+
 def setup_logging():
-    """Write to preply_scraper.log (with timestamps) and also to console."""
-    global logger
-    fmt = "%(asctime)s | %(levelname)s | %(message)s"
-    date_fmt = "%Y-%m-%d %H:%M:%S"
-    logging.basicConfig(
-        level=logging.INFO,
-        format=fmt,
-        datefmt=date_fmt,
-        handlers=[
-            logging.FileHandler(LOG_FILE, encoding="utf-8"),
-            logging.StreamHandler(),
-        ],
-    )
-    logger = logging.getLogger(__name__)
-    return logger
-
-
-logger = None  # set by setup_logging() when run as __main__
+    """Add file handler so logs also persist to disk."""
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(fh)
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -193,9 +186,8 @@ def extract_tutor_details(tutor_div):
             if len(spans) >= 2:
                 desc_body = safe_text(spans[1])
 
-        print(f"  ✓ {name} | {country} | {badge} | {price} | {lesson_duration} | "
-              f"⭐{rating} ({reviews} reviews) | 👥{students} students | "
-              f"📚{lessons} lessons | {speaks}")
+        logger.info("  Tutor: %s | %s | %s | %s | %s | rating %s (%s reviews) | %s students | %s lessons | %s",
+                    name, country, badge, price, lesson_duration, rating, reviews, students, lessons, speaks)
 
         return {
             'tutor_id':        tutor_id,
@@ -218,7 +210,7 @@ def extract_tutor_details(tutor_div):
         }
 
     except Exception as e:
-        print(f"  ✗ Error: {e}")
+        logger.error("  Tutor parse error: %s", e)
         return None
 
 
@@ -239,33 +231,32 @@ def scrape_page(page_url, writer, session):
 
             if response.status_code == 429:
                 wait = RETRY_DELAY_429
-                print(f"  Rate limited. Waiting {wait}s (attempt {attempt}/{MAX_RETRIES})...")
+                logger.warning("  Rate limited. Waiting %ds (attempt %d/%d)...", wait, attempt, MAX_RETRIES)
                 time.sleep(wait)
                 response = session.get(page_url, headers=HEADERS, timeout=20)
 
             if response.status_code != 200:
-                print(f"  Failed — HTTP {response.status_code} (attempt {attempt}/{MAX_RETRIES})")
+                logger.warning("  Failed — HTTP %s (attempt %d/%d)", response.status_code, attempt, MAX_RETRIES)
                 if attempt < MAX_RETRIES:
                     delay = RETRY_DELAY_BASE * attempt
-                    print(f"  Retrying in {delay}s...")
+                    logger.info("  Retrying in %ds...", delay)
                     time.sleep(delay)
                 else:
-                    print("  All retries exhausted — skipping to next page.")
+                    logger.warning("  All retries exhausted — skipping to next page.")
                     return 0, False
                 continue
 
-            # Got 200 — parse and return
             soup = BeautifulSoup(response.content, 'html.parser')
             tutor_divs = soup.find_all('section', {'data-qa-group': 'tutor-profile'})
 
             if not tutor_divs:
-                print("  No tutor cards found — possibly blocked.")
+                logger.warning("  No tutor cards found — possibly blocked.")
                 with open('debug_page.html', 'w', encoding='utf-8') as f:
                     f.write(response.text)
-                print("  Raw HTML saved to debug_page.html")
-                return 0, True  # success=True so caller can apply "batch < 10" rule
+                logger.info("  Raw HTML saved to debug_page.html")
+                return 0, True
 
-            print(f"  Found {len(tutor_divs)} tutors.")
+            logger.info("  Found %d tutors.", len(tutor_divs))
             count = 0
             for tutor_div in tutor_divs:
                 tutor = extract_tutor_details(tutor_div)
@@ -276,23 +267,23 @@ def scrape_page(page_url, writer, session):
 
         except requests.exceptions.Timeout:
             last_exception = "Timeout"
-            print(f"  Timeout (attempt {attempt}/{MAX_RETRIES}).")
+            logger.warning("  Timeout (attempt %d/%d).", attempt, MAX_RETRIES)
             if attempt < MAX_RETRIES:
                 delay = RETRY_DELAY_BASE * attempt
-                print(f"  Retrying in {delay}s...")
+                logger.info("  Retrying in %ds...", delay)
                 time.sleep(delay)
             else:
-                print("  All retries exhausted — skipping to next page.")
+                logger.warning("  All retries exhausted — skipping to next page.")
                 return 0, False
         except Exception as e:
             last_exception = e
-            print(f"  Page error: {e} (attempt {attempt}/{MAX_RETRIES})")
+            logger.error("  Page error: %s (attempt %d/%d)", e, attempt, MAX_RETRIES)
             if attempt < MAX_RETRIES:
                 delay = RETRY_DELAY_BASE * attempt
-                print(f"  Retrying in {delay}s...")
+                logger.info("  Retrying in %ds...", delay)
                 time.sleep(delay)
             else:
-                print("  All retries exhausted — skipping to next page.")
+                logger.warning("  All retries exhausted — skipping to next page.")
                 return 0, False
 
     return 0, False
@@ -315,20 +306,17 @@ def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tu
             writer.writeheader()
 
         for page in range(start_page, total_pages + 1):
-            print(f"\nScraping page {page}/{total_pages}...")
+            logger.info("Scraping page %d/%d...", page, total_pages)
             count, success = scrape_page(f"{base_url}?page={page}", writer, session)
             total_tutors += count
-            print(f"  → Saved: {count} | Total so far: {total_tutors}")
+            logger.info("  Saved: %d | Total so far: %d", count, total_tutors)
             file.flush()
-            # Only break when we successfully fetched and got fewer than 10 tutors (last page)
             if success and count < 10:
-                print(f"  Last page reached (batch {count} < 10). Stopping.")
+                logger.info("  Last page reached (batch %d < 10). Stopping.", count)
                 break
             time.sleep(random.uniform(2.0, 4.5))
 
-    print(f"\n✅ Done! {total_tutors} tutors saved to {output_file}")
-    if logger:
-        logger.info("Subject saved %d tutors to %s", total_tutors, output_file)
+    logger.info("Done! %d tutors saved to %s", total_tutors, output_file)
 
 import re
 import math
@@ -349,7 +337,7 @@ def get_total_pages(session, base_url):
 
     if page_span:
         pages = int(page_span.text.strip())
-        print(f"Detected pages directly: {pages}")
+        logger.info("Detected pages directly: %d", pages)
         return pages
 
     # ─────────────────────────────────────────
@@ -366,15 +354,15 @@ def get_total_pages(session, base_url):
                 total_tutors = int(match.group(1).replace(",", ""))
                 pages = math.ceil(total_tutors / 10)
 
-                print(f"Total tutors: {total_tutors}")
-                print(f"Calculated pages: {pages}")
+                logger.info("Total tutors: %d", total_tutors)
+                logger.info("Calculated pages: %d", pages)
 
                 return pages
 
     # ─────────────────────────────────────────
     # LAST RESORT
     # ─────────────────────────────────────────
-    print("Could not detect page count. Defaulting to 1 page.")
+    logger.warning("Could not detect page count. Defaulting to 1 page.")
     return 1
 
 def extract_subject_from_url(url):
@@ -409,32 +397,32 @@ def scrape_until_end(base_url, output_file):
 
             page_url = f"{base_url}?page={page}"
 
-            print(f"\nScraping page {page}...")
+            logger.info("Scraping page %d...", page)
 
             response = None
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     response = session.get(page_url, headers=HEADERS, timeout=20)
                     if response.status_code == 429:
-                        print(f"  Rate limited. Waiting {RETRY_DELAY_429}s (attempt {attempt}/{MAX_RETRIES})...")
+                        logger.warning("  Rate limited. Waiting %ds (attempt %d/%d)...", RETRY_DELAY_429, attempt, MAX_RETRIES)
                         time.sleep(RETRY_DELAY_429)
                         response = session.get(page_url, headers=HEADERS, timeout=20)
                     if response.status_code != 200:
-                        print(f"  HTTP {response.status_code} (attempt {attempt}/{MAX_RETRIES})")
+                        logger.warning("  HTTP %s (attempt %d/%d)", response.status_code, attempt, MAX_RETRIES)
                         if attempt < MAX_RETRIES:
                             time.sleep(RETRY_DELAY_BASE * attempt)
                             continue
-                        print("  All retries exhausted — skipping to next page.")
+                        logger.warning("  All retries exhausted — skipping to next page.")
                         page += 1
                         response = None
                         break
                     break  # got 200
                 except (requests.exceptions.Timeout, Exception) as e:
-                    print(f"  Error: {e} (attempt {attempt}/{MAX_RETRIES})")
+                    logger.error("  Error: %s (attempt %d/%d)", e, attempt, MAX_RETRIES)
                     if attempt < MAX_RETRIES:
                         time.sleep(RETRY_DELAY_BASE * attempt)
                     else:
-                        print("  All retries exhausted — skipping to next page.")
+                        logger.warning("  All retries exhausted — skipping to next page.")
                         page += 1
                         response = None
                         break
@@ -447,12 +435,12 @@ def scrape_until_end(base_url, output_file):
             tutor_divs = soup.find_all('section', {'data-qa-group': 'tutor-profile'})
 
             if not tutor_divs:
-                print("No tutors found — stopping.")
+                logger.info("No tutors found — stopping.")
                 break
 
             if tutors_per_page is None:
                 tutors_per_page = len(tutor_divs)
-                print(f"Detected tutors per page: {tutors_per_page}")
+                logger.info("Detected tutors per page: %d", tutors_per_page)
 
             count = 0
 
@@ -463,29 +451,26 @@ def scrape_until_end(base_url, output_file):
                     count += 1
                     total_tutors += 1
 
-            print(f"Saved {count} tutors")
+            logger.info("Saved %d tutors (total: %d)", count, total_tutors)
 
-            # Stop only when we got a successful fetch and batch is less than 10
             if count < 10:
-                print("Last page reached (batch < 10).")
+                logger.info("Last page reached (batch < 10).")
                 break
 
             page += 1
             time.sleep(random.uniform(2.0,4.5))
 
-    print(f"\nScraped total tutors: {total_tutors}")
-    if logger:
-        logger.info("Subject (dynamic) saved %d tutors", total_tutors)
+    logger.info("Scraped total tutors: %d", total_tutors)
 
 def log_404(url):
     with open("invalid_subject_urls.txt", "a", encoding="utf-8") as f:
         f.write(url + "\n")
         f.flush()
-    print("Logged 404:", url)
+    logger.warning("Logged invalid URL: %s", url)
 
 if __name__ == "__main__":
 
-    logger = setup_logging()
+    setup_logging()
     logger.info("Scraper run started")
 
     session = requests.Session()
@@ -499,27 +484,22 @@ if __name__ == "__main__":
     try:
         for base_url in subject_urls:
 
-            print(f"\n===== Checking Subject URL: {base_url} =====")
+            logger.info("===== Checking Subject URL: %s =====", base_url)
 
-            # Check if URL is valid before scraping
             response = session.get(base_url, headers=HEADERS, timeout=20)
 
             if response.status_code == 404:
-                print("❌ 404 detected")
                 log_404(base_url)
                 logger.warning("404 skipped: %s", base_url)
                 continue
 
             if response.status_code != 200:
-                print(f"❌ Failed with HTTP {response.status_code}")
                 log_404(base_url)
                 logger.warning("HTTP %s skipped: %s", response.status_code, base_url)
                 continue
 
             subject_name = extract_subject_from_url(base_url)
-            logger.info("Subject started: %s", subject_name)
-
-            print(f"===== Scraping Subject: {subject_name} =====")
+            logger.info("===== Scraping Subject: %s =====", subject_name)
 
             total_pages = get_total_pages(session, base_url)
 
@@ -533,18 +513,14 @@ if __name__ == "__main__":
                     output_file=output_file
                 )
             else:
-                print("Page detection failed — switching to dynamic pagination")
+                logger.info("Page detection failed — switching to dynamic pagination")
                 scrape_until_end(base_url, output_file)
 
             subjects_done += 1
             logger.info("Subject completed: %s -> %s", subject_name, output_file)
 
-        logger.info("Scraper run finished successfully | Subjects completed: %d", subjects_done)
-        logger.info("Scraper run ended")
-        print(f"\n========== Scraper run complete | Subjects completed: {subjects_done} ==========")
-        print(f"Scraper run ended. Check {LOG_FILE} for details.")
+        logger.info("========== Scraper run finished | Subjects completed: %d ==========", subjects_done)
 
     except Exception as e:
-        logger.exception("Scraper run failed: %s", e)
-        print(f"\n========== Scraper run stopped with error ==========")
+        logger.exception("Scraper run FAILED: %s", e)
         raise
