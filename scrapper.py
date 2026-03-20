@@ -6,6 +6,35 @@ import random
 import math
 import re
 
+import json
+import os
+
+CHECKPOINT_FILE = "scrape_checkpoint.json"
+
+
+def load_checkpoint():
+    if not os.path.exists(CHECKPOINT_FILE):
+        return {}
+
+    try:
+        with open(CHECKPOINT_FILE, "r") as f:
+            content = f.read().strip()
+
+            if not content:
+                return {}
+
+            return json.loads(content)
+
+    except json.JSONDecodeError:
+        print("⚠️ Checkpoint file corrupted. Resetting checkpoint.")
+        return {}
+
+def save_checkpoint(subject_url, page):
+    checkpoint = load_checkpoint()
+    checkpoint[subject_url] = page
+
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(checkpoint, f, indent=2)
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -236,31 +265,50 @@ def scrape_page(page_url, writer, session):
         return 0
 
 
-def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tutors_luganda.csv'):
+def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tutors.csv'):
     total_tutors = 0
     session = requests.Session()
-    write_mode = 'w' if start_page == 1 else 'a'
+
+    # DO NOT overwrite file if it exists
+    file_exists = os.path.exists(output_file)
+    write_mode = 'a' if file_exists else 'w'
 
     with open(output_file, mode=write_mode, newline='', encoding='utf-8') as file:
+
         fieldnames = [
             'tutor_id', 'name', 'profile_url', 'country', 'badge',
             'image_url', 'online_status', 'price', 'lesson_duration',
             'rating', 'reviews', 'students', 'lessons', 'teaches',
             'speaks', 'desc_title', 'desc_body'
         ]
+
         writer = csv.DictWriter(file, fieldnames=fieldnames)
-        if write_mode == 'w':
+
+        if not file_exists:
             writer.writeheader()
 
+        print(f"Starting from page {start_page}")
+
         for page in range(start_page, total_pages + 1):
-            print(f"\nScraping page {page}/{total_pages}...")
-            count = scrape_page(f"{base_url}?page={page}", writer, session)
+
+            print(f"\nScraping page {page}/{total_pages}")
+
+            page_url = f"{base_url}?page={page}"
+
+            count = scrape_page(page_url, writer, session)
+
             total_tutors += count
-            print(f"  → Saved: {count} | Total so far: {total_tutors}")
+
+            print(f"Saved {count} tutors | Total so far: {total_tutors}")
+
+            # SAVE CHECKPOINT AFTER PAGE FINISHES
+            save_checkpoint(base_url, page + 1)
+
             file.flush()
+
             time.sleep(random.uniform(2.0, 4.5))
 
-    print(f"\n✅ Done! {total_tutors} tutors saved to {output_file}")
+    print(f"\nFinished scraping {base_url}")
 
 import re
 import math
@@ -322,10 +370,14 @@ def scrape_until_end(base_url, output_file):
 
     session = requests.Session()
     total_tutors = 0
-    page = 1
+    checkpoint = load_checkpoint()
+    page = checkpoint.get(base_url, 1)
     tutors_per_page = None
 
-    with open(output_file, "w", newline="", encoding="utf-8") as file:
+    file_exists = os.path.exists(output_file)
+    write_mode = "a" if file_exists else "w"
+
+    with open(output_file, write_mode, newline="", encoding="utf-8") as file:
 
         fieldnames = [
             'tutor_id','name','profile_url','country','badge',
@@ -335,7 +387,8 @@ def scrape_until_end(base_url, output_file):
         ]
 
         writer = csv.DictWriter(file, fieldnames=fieldnames)
-        writer.writeheader()
+        if not file_exists:
+            writer.writeheader()
 
         while True:
 
@@ -372,6 +425,11 @@ def scrape_until_end(base_url, output_file):
 
             print(f"Saved {count} tutors")
 
+            # SAVE CHECKPOINT
+            save_checkpoint(base_url, page + 1)
+            print(f"Checkpoint saved → next page {page + 1}")
+
+
             # Stop condition
             if count < tutors_per_page:
                 print("Last page reached.")
@@ -392,6 +450,8 @@ if __name__ == "__main__":
 
     session = requests.Session()
 
+    os.makedirs("preply_tutors_data", exist_ok=True)
+
     with open("subject_urls.txt", "r", encoding="utf-8") as f:
         subject_urls = [line.strip() for line in f if line.strip()]
 
@@ -399,7 +459,6 @@ if __name__ == "__main__":
 
         print(f"\n===== Checking Subject URL: {base_url} =====")
 
-        # Check if URL is valid before scraping
         response = session.get(base_url, headers=HEADERS, timeout=20)
 
         if response.status_code == 404:
@@ -420,13 +479,20 @@ if __name__ == "__main__":
 
         output_file = f"preply_tutors_data/preply_tutors_{subject_name}.csv"
 
+        checkpoint = load_checkpoint()
+        start_page = checkpoint.get(base_url, 1)
+
+        print(f"Checkpoint loaded → starting from page {start_page}")
+
         if total_pages > 1:
+
             scrape_all_pages(
                 base_url=base_url,
                 total_pages=total_pages,
-                start_page=1,
+                start_page=start_page,
                 output_file=output_file
             )
+
         else:
             print("Page detection failed — switching to dynamic pagination")
             scrape_until_end(base_url, output_file)
