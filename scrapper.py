@@ -1,3 +1,4 @@
+import os
 import requests
 from bs4 import BeautifulSoup
 import csv
@@ -5,36 +6,25 @@ import time
 import random
 import math
 import re
+import logging
 
-import json
-import os
-
-CHECKPOINT_FILE = "scrape_checkpoint.json"
+# Log file so you can check on the server that the job ran
+LOG_FILE = os.environ.get("PREPLY_SCRAPER_LOG", "preply_scraper.log")
 
 
-def load_checkpoint():
-    if not os.path.exists(CHECKPOINT_FILE):
-        return {}
+logger = logging.getLogger("preply_scraper")
+logger.setLevel(logging.INFO)
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+logger.addHandler(_console)
 
-    try:
-        with open(CHECKPOINT_FILE, "r") as f:
-            content = f.read().strip()
 
-            if not content:
-                return {}
+def setup_logging():
+    """Add file handler so logs also persist to disk."""
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(fh)
 
-            return json.loads(content)
-
-    except json.JSONDecodeError:
-        print("⚠️ Checkpoint file corrupted. Resetting checkpoint.")
-        return {}
-
-def save_checkpoint(subject_url, page):
-    checkpoint = load_checkpoint()
-    checkpoint[subject_url] = page
-
-    with open(CHECKPOINT_FILE, "w") as f:
-        json.dump(checkpoint, f, indent=2)
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept-Language': 'en-US,en;q=0.9',
@@ -196,9 +186,8 @@ def extract_tutor_details(tutor_div):
             if len(spans) >= 2:
                 desc_body = safe_text(spans[1])
 
-        print(f"  ✓ {name} | {country} | {badge} | {price} | {lesson_duration} | "
-              f"⭐{rating} ({reviews} reviews) | 👥{students} students | "
-              f"📚{lessons} lessons | {speaks}")
+        logger.info("  Tutor: %s | %s | %s | %s | %s | rating %s (%s reviews) | %s students | %s lessons | %s",
+                    name, country, badge, price, lesson_duration, rating, reviews, students, lessons, speaks)
 
         return {
             'tutor_id':        tutor_id,
@@ -221,94 +210,113 @@ def extract_tutor_details(tutor_div):
         }
 
     except Exception as e:
-        print(f"  ✗ Error: {e}")
+        logger.error("  Tutor parse error: %s", e)
         return None
 
 
-def scrape_page(page_url, writer, session):
-    try:
-        response = session.get(page_url, headers=HEADERS, timeout=20)
+# Retry config for non-200 responses
+MAX_RETRIES = 3
+RETRY_DELAY_BASE = 10  # seconds
+RETRY_DELAY_429 = 60   # seconds for rate limit
 
-        if response.status_code == 429:
-            print("  Rate limited. Waiting 60s...")
-            time.sleep(60)
+
+def scrape_page(page_url, writer, session):
+    """Fetch a page with retries. Returns (tutor_count, success).
+    success=False means we never got 200 (caller should try next page, not break).
+    """
+    last_exception = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
             response = session.get(page_url, headers=HEADERS, timeout=20)
 
-        if response.status_code != 200:
-            print(f"  Failed — HTTP {response.status_code}")
-            return 0
+            if response.status_code == 429:
+                wait = RETRY_DELAY_429
+                logger.warning("  Rate limited. Waiting %ds (attempt %d/%d)...", wait, attempt, MAX_RETRIES)
+                time.sleep(wait)
+                response = session.get(page_url, headers=HEADERS, timeout=20)
 
-        soup = BeautifulSoup(response.content, 'html.parser')
-        tutor_divs = soup.find_all('section', {'data-qa-group': 'tutor-profile'})
+            if response.status_code != 200:
+                logger.warning("  Failed — HTTP %s (attempt %d/%d)", response.status_code, attempt, MAX_RETRIES)
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_DELAY_BASE * attempt
+                    logger.info("  Retrying in %ds...", delay)
+                    time.sleep(delay)
+                else:
+                    logger.warning("  All retries exhausted — skipping to next page.")
+                    return 0, False
+                continue
 
-        if not tutor_divs:
-            print("  No tutor cards found — possibly blocked.")
-            with open('debug_page.html', 'w', encoding='utf-8') as f:
-                f.write(response.text)
-            print("  Raw HTML saved to debug_page.html")
-            return 0
+            soup = BeautifulSoup(response.content, 'html.parser')
+            tutor_divs = soup.find_all('section', {'data-qa-group': 'tutor-profile'})
 
-        print(f"  Found {len(tutor_divs)} tutors.")
-        count = 0
-        for tutor_div in tutor_divs:
-            tutor = extract_tutor_details(tutor_div)
-            if tutor:
-                writer.writerow(tutor)
-                count += 1
-        return count
+            if not tutor_divs:
+                logger.warning("  No tutor cards found — possibly blocked.")
+                with open('debug_page.html', 'w', encoding='utf-8') as f:
+                    f.write(response.text)
+                logger.info("  Raw HTML saved to debug_page.html")
+                return 0, True
 
-    except requests.exceptions.Timeout:
-        print("  Timeout. Skipping.")
-        return 0
-    except Exception as e:
-        print(f"  Page error: {e}")
-        return 0
+            logger.info("  Found %d tutors.", len(tutor_divs))
+            count = 0
+            for tutor_div in tutor_divs:
+                tutor = extract_tutor_details(tutor_div)
+                if tutor:
+                    writer.writerow(tutor)
+                    count += 1
+            return count, True
+
+        except requests.exceptions.Timeout:
+            last_exception = "Timeout"
+            logger.warning("  Timeout (attempt %d/%d).", attempt, MAX_RETRIES)
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY_BASE * attempt
+                logger.info("  Retrying in %ds...", delay)
+                time.sleep(delay)
+            else:
+                logger.warning("  All retries exhausted — skipping to next page.")
+                return 0, False
+        except Exception as e:
+            last_exception = e
+            logger.error("  Page error: %s (attempt %d/%d)", e, attempt, MAX_RETRIES)
+            if attempt < MAX_RETRIES:
+                delay = RETRY_DELAY_BASE * attempt
+                logger.info("  Retrying in %ds...", delay)
+                time.sleep(delay)
+            else:
+                logger.warning("  All retries exhausted — skipping to next page.")
+                return 0, False
+
+    return 0, False
 
 
-def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tutors.csv'):
+def scrape_all_pages(base_url, total_pages, start_page=1, output_file='preply_tutors_luganda.csv'):
     total_tutors = 0
     session = requests.Session()
-
-    # DO NOT overwrite file if it exists
-    file_exists = os.path.exists(output_file)
-    write_mode = 'a' if file_exists else 'w'
+    write_mode = 'w' if start_page == 1 else 'a'
 
     with open(output_file, mode=write_mode, newline='', encoding='utf-8') as file:
-
         fieldnames = [
             'tutor_id', 'name', 'profile_url', 'country', 'badge',
             'image_url', 'online_status', 'price', 'lesson_duration',
             'rating', 'reviews', 'students', 'lessons', 'teaches',
             'speaks', 'desc_title', 'desc_body'
         ]
-
         writer = csv.DictWriter(file, fieldnames=fieldnames)
-
-        if not file_exists:
+        if write_mode == 'w':
             writer.writeheader()
 
-        print(f"Starting from page {start_page}")
-
         for page in range(start_page, total_pages + 1):
-
-            print(f"\nScraping page {page}/{total_pages}")
-
-            page_url = f"{base_url}?page={page}"
-
-            count = scrape_page(page_url, writer, session)
-
+            logger.info("Scraping page %d/%d...", page, total_pages)
+            count, success = scrape_page(f"{base_url}?page={page}", writer, session)
             total_tutors += count
-
-            print(f"Saved {count} tutors | Total so far: {total_tutors}")
-
-            # SAVE CHECKPOINT AFTER PAGE FINISHES
-            save_checkpoint(base_url, page + 1)
-
+            logger.info("  Saved: %d | Total so far: %d", count, total_tutors)
             file.flush()
-
+            if success and count < 10:
+                logger.info("  Last page reached (batch %d < 10). Stopping.", count)
+                break
             time.sleep(random.uniform(2.0, 4.5))
 
-    print(f"\nFinished scraping {base_url}")
+    logger.info("Done! %d tutors saved to %s", total_tutors, output_file)
 
 import re
 import math
@@ -329,7 +337,7 @@ def get_total_pages(session, base_url):
 
     if page_span:
         pages = int(page_span.text.strip())
-        print(f"Detected pages directly: {pages}")
+        logger.info("Detected pages directly: %d", pages)
         return pages
 
     # ─────────────────────────────────────────
@@ -346,15 +354,15 @@ def get_total_pages(session, base_url):
                 total_tutors = int(match.group(1).replace(",", ""))
                 pages = math.ceil(total_tutors / 10)
 
-                print(f"Total tutors: {total_tutors}")
-                print(f"Calculated pages: {pages}")
+                logger.info("Total tutors: %d", total_tutors)
+                logger.info("Calculated pages: %d", pages)
 
                 return pages
 
     # ─────────────────────────────────────────
     # LAST RESORT
     # ─────────────────────────────────────────
-    print("Could not detect page count. Defaulting to 1 page.")
+    logger.warning("Could not detect page count. Defaulting to 1 page.")
     return 1
 
 def extract_subject_from_url(url):
@@ -370,14 +378,10 @@ def scrape_until_end(base_url, output_file):
 
     session = requests.Session()
     total_tutors = 0
-    checkpoint = load_checkpoint()
-    page = checkpoint.get(base_url, 1)
+    page = 1
     tutors_per_page = None
 
-    file_exists = os.path.exists(output_file)
-    write_mode = "a" if file_exists else "w"
-
-    with open(output_file, write_mode, newline="", encoding="utf-8") as file:
+    with open(output_file, "w", newline="", encoding="utf-8") as file:
 
         fieldnames = [
             'tutor_id','name','profile_url','country','badge',
@@ -387,32 +391,56 @@ def scrape_until_end(base_url, output_file):
         ]
 
         writer = csv.DictWriter(file, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
+        writer.writeheader()
 
         while True:
 
             page_url = f"{base_url}?page={page}"
 
-            print(f"\nScraping page {page}...")
+            logger.info("Scraping page %d...", page)
 
-            response = session.get(page_url, headers=HEADERS, timeout=20)
+            response = None
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    response = session.get(page_url, headers=HEADERS, timeout=20)
+                    if response.status_code == 429:
+                        logger.warning("  Rate limited. Waiting %ds (attempt %d/%d)...", RETRY_DELAY_429, attempt, MAX_RETRIES)
+                        time.sleep(RETRY_DELAY_429)
+                        response = session.get(page_url, headers=HEADERS, timeout=20)
+                    if response.status_code != 200:
+                        logger.warning("  HTTP %s (attempt %d/%d)", response.status_code, attempt, MAX_RETRIES)
+                        if attempt < MAX_RETRIES:
+                            time.sleep(RETRY_DELAY_BASE * attempt)
+                            continue
+                        logger.warning("  All retries exhausted — skipping to next page.")
+                        page += 1
+                        response = None
+                        break
+                    break  # got 200
+                except (requests.exceptions.Timeout, Exception) as e:
+                    logger.error("  Error: %s (attempt %d/%d)", e, attempt, MAX_RETRIES)
+                    if attempt < MAX_RETRIES:
+                        time.sleep(RETRY_DELAY_BASE * attempt)
+                    else:
+                        logger.warning("  All retries exhausted — skipping to next page.")
+                        page += 1
+                        response = None
+                        break
 
-            if response.status_code != 200:
-                print("Page request failed.")
-                break
+            if response is None or response.status_code != 200:
+                continue
 
             soup = BeautifulSoup(response.content, "html.parser")
 
             tutor_divs = soup.find_all('section', {'data-qa-group': 'tutor-profile'})
 
             if not tutor_divs:
-                print("No tutors found — stopping.")
+                logger.info("No tutors found — stopping.")
                 break
 
             if tutors_per_page is None:
                 tutors_per_page = len(tutor_divs)
-                print(f"Detected tutors per page: {tutors_per_page}")
+                logger.info("Detected tutors per page: %d", tutors_per_page)
 
             count = 0
 
@@ -423,76 +451,76 @@ def scrape_until_end(base_url, output_file):
                     count += 1
                     total_tutors += 1
 
-            print(f"Saved {count} tutors")
+            logger.info("Saved %d tutors (total: %d)", count, total_tutors)
 
-            # SAVE CHECKPOINT
-            save_checkpoint(base_url, page + 1)
-            print(f"Checkpoint saved → next page {page + 1}")
-
-
-            # Stop condition
-            if count < tutors_per_page:
-                print("Last page reached.")
+            if count < 10:
+                logger.info("Last page reached (batch < 10).")
                 break
 
             page += 1
             time.sleep(random.uniform(2.0,4.5))
 
-    print(f"\nScraped total tutors: {total_tutors}")
+    logger.info("Scraped total tutors: %d", total_tutors)
 
 def log_404(url):
     with open("invalid_subject_urls.txt", "a", encoding="utf-8") as f:
         f.write(url + "\n")
         f.flush()
-    print("Logged 404:", url)
+    logger.warning("Logged invalid URL: %s", url)
 
 if __name__ == "__main__":
 
-    session = requests.Session()
+    setup_logging()
+    logger.info("Scraper run started")
 
-    os.makedirs("preply_tutors_data", exist_ok=True)
+    session = requests.Session()
 
     with open("subject_urls.txt", "r", encoding="utf-8") as f:
         subject_urls = [line.strip() for line in f if line.strip()]
 
-    for base_url in subject_urls:
+    logger.info("Subjects to process: %d | Log file: %s", len(subject_urls), LOG_FILE)
+    subjects_done = 0
 
-        print(f"\n===== Checking Subject URL: {base_url} =====")
+    try:
+        for base_url in subject_urls:
 
-        response = session.get(base_url, headers=HEADERS, timeout=20)
+            logger.info("===== Checking Subject URL: %s =====", base_url)
 
-        if response.status_code == 404:
-            print("❌ 404 detected")
-            log_404(base_url)
-            continue
+            response = session.get(base_url, headers=HEADERS, timeout=20)
 
-        if response.status_code != 200:
-            print(f"❌ Failed with HTTP {response.status_code}")
-            log_404(base_url)
-            continue
+            if response.status_code == 404:
+                log_404(base_url)
+                logger.warning("404 skipped: %s", base_url)
+                continue
 
-        subject_name = extract_subject_from_url(base_url)
+            if response.status_code != 200:
+                log_404(base_url)
+                logger.warning("HTTP %s skipped: %s", response.status_code, base_url)
+                continue
 
-        print(f"===== Scraping Subject: {subject_name} =====")
+            subject_name = extract_subject_from_url(base_url)
+            logger.info("===== Scraping Subject: %s =====", subject_name)
 
-        total_pages = get_total_pages(session, base_url)
+            total_pages = get_total_pages(session, base_url)
 
-        output_file = f"preply_tutors_data/preply_tutors_{subject_name}.csv"
+            output_file = f"preply_tutors_data/preply_tutors_{subject_name}.csv"
 
-        checkpoint = load_checkpoint()
-        start_page = checkpoint.get(base_url, 1)
+            if total_pages > 1:
+                scrape_all_pages(
+                    base_url=base_url,
+                    total_pages=total_pages,
+                    start_page=1,
+                    output_file=output_file
+                )
+            else:
+                logger.info("Page detection failed — switching to dynamic pagination")
+                scrape_until_end(base_url, output_file)
 
-        print(f"Checkpoint loaded → starting from page {start_page}")
+            subjects_done += 1
+            logger.info("Subject completed: %s -> %s", subject_name, output_file)
 
-        if total_pages > 1:
+        logger.info("========== Scraper run finished | Subjects completed: %d ==========", subjects_done)
 
-            scrape_all_pages(
-                base_url=base_url,
-                total_pages=total_pages,
-                start_page=start_page,
-                output_file=output_file
-            )
-
-        else:
-            print("Page detection failed — switching to dynamic pagination")
-            scrape_until_end(base_url, output_file)
+    except Exception as e:
+        logger.exception("Scraper run FAILED: %s", e)
+        raise
